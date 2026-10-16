@@ -1,4 +1,4 @@
-/* HDFilmCehennemi for Nuvio v1.0.0
+/* HDFilmCehennemi for Nuvio v1.0.1
 Decoder adaptations: Copyright (c) 2024 enXov
 MIT License
 
@@ -102,56 +102,107 @@ module.exports = { entities: entities, text: text, attr: attr, origin: origin, a
 'use strict';
 var u = require("utils");
 var USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+var MAX_BYTES = 1024 * 1024;
 
-function safeError(message) {
+function safeError(message, blocked, transient) {
   var error = new Error(message);
   error.hdfcSafe = true;
+  error.hdfcBlocked = !!blocked;
+  error.hdfcTransient = !!transient;
   return error;
+}
+
+// Only request state is retained. Native TV redirects do not safely scope a
+// manually supplied Cookie header, so this provider never copies site cookies.
+function session() { return { deadline: Date.now() + 45000, blocked: {} }; }
+
+function byteLength(value) {
+  var bytes = 0;
+  for (var i = 0; i < value.length && bytes <= MAX_BYTES; i++) {
+    var ch = value.charCodeAt(i);
+    if (ch < 128) bytes++;
+    else if (ch < 2048) bytes += 2;
+    else if (ch >= 55296 && ch <= 56319 && i + 1 < value.length && value.charCodeAt(i + 1) >= 56320 && value.charCodeAt(i + 1) <= 57343) { bytes += 4; i++; }
+    else bytes += 3;
+  }
+  return bytes;
 }
 
 function request(url, options) {
   options = options || {};
-  if (!/^https?:\/\//i.test(url)) return Promise.reject(new Error('Unsupported request URL'));
-  var headers = { 'User-Agent': USER_AGENT, Accept: options.json ? 'application/json' : 'text/html,application/xhtml+xml,*/*;q=0.8', 'Accept-Language': 'tr-TR,tr;q=0.9,en;q=0.8' };
+  if (!/^https?:\/\/[^\s/?#@]+(?:[/?#][^\s]*)?$/i.test(url)) return Promise.reject(safeError('Unsupported request URL'));
+  var site = u.origin(url);
+  var state = options.session || session();
+  var method = String(options.method || 'GET').toUpperCase();
+  var timeout = Math.min(Math.max(Number(options.timeout) || 12000, 1), 12000);
+  var headers = {
+    'User-Agent': USER_AGENT,
+    Accept: options.json ? 'application/json, text/javascript, */*; q=0.01' : 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'tr-TR,tr;q=0.9,en;q=0.8'
+  };
   if (options.referer) headers.Referer = options.referer;
   if (options.origin) headers.Origin = options.origin;
   if (options.search) headers['X-Requested-With'] = 'fetch';
   if (options.bearer) headers.Authorization = 'Bearer ' + options.bearer;
-  var controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
-  var timer = null;
-  var finished = false;
-  return new Promise(function (resolve, reject) {
-    function finish(error, value) {
-      if (finished) return;
-      finished = true;
-      if (timer !== null && typeof clearTimeout === 'function') clearTimeout(timer);
-      if (error) reject(error); else resolve(value);
-    }
-    if (typeof setTimeout === 'function') {
-      timer = setTimeout(function () {
-        finish(safeError('Request timed out: ' + u.origin(url)));
-        if (controller) controller.abort();
-      }, options.timeout || 12000);
-    }
-    var init = { method: options.method || 'GET', headers: headers };
-    if (controller) init.signal = controller.signal;
-    Promise.resolve().then(function () { return fetch(url, init); }).then(function (response) {
-      if (response.status === 403 || response.status === 451) throw safeError('Site access blocked (HTTP ' + response.status + '): ' + u.origin(url));
-      if (!response.ok) throw safeError('HTTP ' + response.status + ': ' + u.origin(url));
-      return response.text();
-    }).then(function (body) {
-      if (body.length > 2 * 1024 * 1024) throw safeError('Response is too large: ' + u.origin(url));
-      if (/<title>\s*(?:Just a moment|Attention Required)/i.test(body) || /cf-browser-verification/i.test(body)) throw safeError('Cloudflare challenge: ' + u.origin(url));
-      var value = body;
-      if (options.json) {
-        try { value = JSON.parse(body); } catch (ignored) { throw safeError('Invalid JSON response: ' + u.origin(url)); }
+
+  function blocked(message) {
+    state.blocked[site] = message;
+    return safeError(message, true);
+  }
+
+  function attempt(number) {
+    if (state.blocked[site]) return Promise.reject(safeError(state.blocked[site], true));
+    var remaining = state.deadline - Date.now();
+    if (remaining <= 0) return Promise.reject(safeError('Lookup time budget exhausted: ' + site));
+    var controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    var timer = null;
+    var finished = false;
+    return new Promise(function (resolve, reject) {
+      function finish(error, value) {
+        if (finished) return;
+        finished = true;
+        if (timer !== null && typeof clearTimeout === 'function') clearTimeout(timer);
+        if (error) reject(error); else resolve(value);
       }
-      finish(null, value);
-    }).catch(function (error) { finish(error && error.hdfcSafe ? error : safeError('Network request failed: ' + u.origin(url))); });
-  });
+      if (typeof setTimeout === 'function') {
+        timer = setTimeout(function () {
+          finish(safeError('Request timed out: ' + site, false, true));
+          if (controller) controller.abort();
+        }, Math.min(timeout, remaining));
+      }
+      var init = { method: method, headers: headers, credentials: 'same-origin' };
+      if (controller) init.signal = controller.signal;
+      Promise.resolve().then(function () { return fetch(url, init); }).then(function (response) {
+        if (finished) return;
+        var mitigation = response.headers && typeof response.headers.get === 'function' ? response.headers.get('cf-mitigated') : '';
+        if (response.status === 403 || response.status === 429 || response.status === 451) throw blocked('Site access blocked (HTTP ' + response.status + '): ' + site);
+        if (mitigation === 'challenge') throw blocked('Cloudflare challenge: ' + site);
+        if (!response.status) throw safeError('Network request failed: ' + site, false, true);
+        return response.text().then(function (body) {
+          if (finished) return;
+          if (byteLength(body) > MAX_BYTES) throw safeError('Response exceeds TV size limit: ' + site);
+          if (/<title[^>]*>\s*(?:Just a moment|Attention Required)/i.test(body) || /cf-browser-verification|class=["']cf-turnstile/i.test(body)) throw blocked('Cloudflare challenge: ' + site);
+          if (!response.ok) throw safeError('HTTP ' + response.status + ': ' + site, false, [502, 503, 504].indexOf(response.status) !== -1);
+          var value = body;
+          if (options.json) {
+            try { value = JSON.parse(body); } catch (ignored) { throw safeError('Invalid JSON response: ' + site); }
+          }
+          finish(null, value);
+        });
+      }).catch(function (error) {
+        finish(error && error.hdfcSafe ? error : safeError('Network request failed: ' + site, false, true));
+      });
+    }).catch(function (error) {
+      // One GET retry for a transport failure or a temporary upstream outage.
+      // Never retry access restrictions, verification pages, or malformed data.
+      if (method === 'GET' && number === 0 && error.hdfcTransient && state.deadline - Date.now() >= timeout) return attempt(1);
+      throw error;
+    });
+  }
+  return attempt(0);
 }
 
-module.exports = { request: request, USER_AGENT: USER_AGENT };
+module.exports = { request: request, USER_AGENT: USER_AGENT, session: session };
 
 },
 "catalog": function(module, exports, require) {
@@ -1006,7 +1057,7 @@ function metadata(id, type, cfg) {
   var token = cfg.key.length > 40;
   var url = 'https://api.themoviedb.org/3/' + type + '/' + encodeURIComponent(id) + '?language=tr-TR&append_to_response=external_ids';
   if (!token) url += '&api_key=' + encodeURIComponent(cfg.key);
-  return http.request(url, { json: true, bearer: token ? cfg.key : '' }).then(function (data) {
+  return http.request(url, { json: true, bearer: token ? cfg.key : '', session: cfg.session }).then(function (data) {
     var imdb = data.external_ids && data.external_ids.imdb_id || data.imdb_id || '';
     return {
       type: type,
@@ -1024,11 +1075,15 @@ function search(meta, cfg) {
   function next(index) {
     if (index >= queries.length) return Promise.resolve([]);
     var query = queries[index];
-    return http.request(cfg.site + '/search/?q=' + encodeURIComponent(query), { json: true, search: true, referer: cfg.site + '/' }).then(function (data) {
+    return http.request(cfg.site + '/search/?q=' + encodeURIComponent(query), { json: true, search: true, referer: cfg.site + '/', session: cfg.session }).then(function (data) {
       var matches = catalog.rankResults(catalog.parseResults(data, cfg.site), meta, query === meta.imdb);
-      return matches.length ? matches.slice(0, 2) : next(index + 1);
+      if (!matches.length) return next(index + 1);
+      return matches.slice(0, 2).map(function (match) {
+        match.referer = cfg.site + '/search/?q=' + encodeURIComponent(query);
+        return match;
+      });
     }).catch(function (error) {
-      if (/Cloudflare|blocked/i.test(error.message)) throw error;
+      if (error.hdfcBlocked || /budget exhausted/i.test(error.message)) throw error;
       return next(index + 1);
     });
   }
@@ -1063,7 +1118,7 @@ function extractPage(html, pageUrl, cfg, meta) {
   var direct = local.streams.map(function (stream) { return formatStream(stream, { url: pageUrl, name: 'Direct' }, meta); });
   var errors = [];
   return Promise.all(frames.map(function (frame) {
-    return http.request(frame.url, { referer: cfg.site + '/' }).then(function (body) {
+    return http.request(frame.url, { referer: pageUrl, session: cfg.session }).then(function (body) {
       return { frame: frame, data: player.extractPlayer(body, frame.url) };
     }).catch(function (error) { errors.push(error.message); return null; });
   })).then(function (results) {
@@ -1083,7 +1138,7 @@ function extractPage(html, pageUrl, cfg, meta) {
       // Unverified file metadata would require downloading binary media on runtimes
       // that do not implement HEAD. Only accept playlist fallbacks we can inspect.
       if (/\.(?:mp4|mkv)(?:[?#]|$)/i.test(item.stream.url)) return validate(index + 1);
-      return http.request(item.stream.url, { referer: u.origin(item.frame.url) + '/', origin: u.origin(item.frame.url) }).then(function (body) {
+      return http.request(item.stream.url, { referer: u.origin(item.frame.url) + '/', origin: u.origin(item.frame.url), session: cfg.session }).then(function (body) {
         if (!/^\s*#EXTM3U/.test(body)) return validate(index + 1);
         return [formatStream(item.stream, item.frame, meta)];
       }).catch(function () { return validate(index + 1); });
@@ -1096,20 +1151,22 @@ function getStreams(tmdbId, mediaType, season, episode) {
   if (!/^\d+$/.test(String(tmdbId)) || ['movie', 'tv'].indexOf(mediaType) === -1) return Promise.resolve([]);
   if (mediaType === 'tv' && (!/^\d+$/.test(String(season)) || !/^\d+$/.test(String(episode)) || Number(season) < 0 || Number(episode) < 1)) return Promise.resolve([]);
   var cfg = config();
+  cfg.session = http.session();
   return metadata(String(tmdbId), mediaType, cfg).then(function (meta) {
     return search(meta, cfg).then(function (matches) {
       function tryMatch(index) {
         if (index >= matches.length) return Promise.resolve([]);
         var match = matches[index];
-        return http.request(match.url, { referer: cfg.site + '/' }).then(function (html) {
+        return http.request(match.url, { referer: match.referer || cfg.site + '/', session: cfg.session }).then(function (html) {
           if (mediaType === 'movie') return { html: html, url: match.url };
           var target = catalog.episodeUrl(html, match.url, season, episode);
           if (!target) return null;
-          return http.request(target, { referer: match.url }).then(function (body) { return { html: body, url: target }; });
+          return http.request(target, { referer: match.url, session: cfg.session }).then(function (body) { return { html: body, url: target }; });
         }).then(function (page) {
           if (!page) return [];
           return extractPage(page.html, page.url, cfg, meta);
         }).then(function (streams) { return streams.length ? streams : tryMatch(index + 1); }).catch(function (error) {
+          if (error.hdfcBlocked || /budget exhausted/i.test(error.message)) throw error;
           console.warn('[HDFilmCehennemi] ' + error.message);
           return tryMatch(index + 1);
         });

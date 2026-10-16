@@ -22,11 +22,23 @@ This provider adds playback sources for titles selected in Nuvio. It does not im
 
 The provider uses Nuvio's supplied TMDB key when available. If your build does not provide one, enter your own TMDB API key or API Read Access Token in provider settings. [TMDB authentication documentation](https://developer.themoviedb.org/docs/authentication-application).
 
+## Version 1.0.1
+
+- Sends the actual search, series and episode referrer when following pages and loading players.
+- Uses document/AJAX Accept headers and retries temporary GET transport errors or HTTP 502/503/504 once.
+- Shares a 45-second lookup deadline; in-flight requests on TV builds without guest timers still rely on Nuvio's native timeout.
+- Stops repeated requests to an origin after HTTP 403/429/451 or a recognized verification response.
+- Enforces the TV's 1 MiB UTF-8 response limit. No manual site-cookie forwarding or downloaded-script execution.
+
+Refresh this repository in Nuvio to obtain the update. The manifest address is unchanged.
+
 ## Verification
 
-On 16 October 2026, all 30 automated tests passed. Live website checks resolved two sources each for Inception and Interstellar, including five and six subtitles respectively. Their first HLS playlists loaded and each listed two audio renditions.
+On 16 October 2026, all **51 automated tests** and **nine Nuvio TV QuickJS engine checks** passed. Engine checks used Nuvio's exact polyfill with 32 MiB memory and 512 KiB stack, covering movie/episode resolution, stored real players, referrers, access blocks and bounded retries.
 
-The live checks supplied known TMDB metadata locally; site search, movie pages, player pages and playlists were fetched live. Actual video playback and TMDB authentication inside Nuvio were not tested. A live series page returned HTTP 403, so live TV extraction remains unverified. Website access and player formats can change.
+Live checks of the updated bundle through the official Nuvio TV networking service running on Windows Node returned two Inception sources. Breaking Bad search succeeded, but the series page still returned **Cloudflare HTTP 403**. **This update does not resolve that demonstrated access restriction.**
+
+Live checks supplied known TMDB metadata locally; website requests were live. Physical Samsung TV playback and TMDB authentication inside Nuvio were not tested. The plugin runs directly in Nuvio and does not add a PC resolver. Website access and player formats can change.
 
 ## Source and development
 
